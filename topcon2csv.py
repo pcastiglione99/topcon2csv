@@ -6,39 +6,39 @@ import math
 import re
 from pathlib import Path
 
-# Byte di framing usati dal trasferimento seriale Topcon
+# Framing bytes used by the Topcon serial transfer
 STX = b"\x02"
 ETX = b"\x03"
 
 # ============================================================
-# CONFIGURAZIONE
+# CONFIGURATION
 # ============================================================
 
-# Coordinate della stazione
+# Station coordinates
 STATION_X = 0.0
 STATION_Y = 0.0
 STATION_Z = 0.0
 
-# Convenzione angolo orizzontale:
-# True  -> 0 gon = Nord, angolo crescente in senso orario
-# False -> 0 gon = asse X, angolo crescente antiorario
+# Horizontal angle convention:
+# True  -> 0 gon = North, angle increasing clockwise
+# False -> 0 gon = X axis, angle increasing counter-clockwise
 HORIZONTAL_FROM_NORTH = True
 
 
 # ============================================================
-# CONVERSIONI ANGOLARI
+# ANGLE CONVERSIONS
 # ============================================================
 
 def gon_to_rad(gon):
-    """Converte gon in radianti."""
+    """Convert gon to radians."""
     return gon * math.pi / 200.0
 
 
 def parse_gon(value):
     """
-    Decodifica un angolo Topcon.
+    Decode a Topcon angle.
 
-    Esempi:
+    Examples:
         1001100 -> 100.1100 gon
         0009350 -> 0.9350 gon
         0977090 -> 97.7090 gon
@@ -49,48 +49,49 @@ def parse_gon(value):
     if not value:
         return None
 
-    # I valori Topcon hanno normalmente 4 decimali impliciti.
+    # Topcon values normally carry 4 implicit decimal places.
     return int(value) / 10000.0
 
 
 # ============================================================
-# PULIZIA DATI GREZZI (framing seriale STX/ETX)
+# RAW DATA CLEANUP (STX/ETX serial framing)
 # ============================================================
 
 def clean_raw_data(raw):
     """
-    Il file grezzo Topcon e' un dump seriale suddiviso in blocchi da
-    132 caratteri, delimitati da STX (0x02) all'inizio e da
-    ETX CR LF (0x03 0x0D 0x0A) alla fine:
+    The raw Topcon file is a serial dump split into 132-character
+    blocks, delimited by STX (0x02) at the beginning and by
+    ETX CR LF (0x03 0x0D 0x0A) at the end:
 
-        \\x02 <128 byte di dati> <4 cifre di contatore/checksum> \\x03\\r\\n
+        \\x02 <128 data bytes> <4 counter/checksum digits> \\x03\\r\\n
 
-    Le 4 cifre finali di ogni blocco NON fanno parte dei dati dello
-    strumento: sono un contatore di blocco del protocollo di
-    trasferimento. Se il file viene letto come testo continuo senza
-    rimuoverle, finiscono per inserirsi nel mezzo dei campi numerici
-    (distanza, angoli) proprio in corrispondenza dei confini di
-    blocco, rompendo il pattern atteso e facendo perdere silenziosamente
-    le osservazioni che cadono a cavallo di un confine.
+    The 4 trailing digits of each block are NOT part of the
+    instrument data: they are a block counter belonging to the
+    transfer protocol. If the file is read as continuous text
+    without stripping them, they end up inserted in the middle of
+    the numeric fields (distance, angles) exactly at the block
+    boundaries, breaking the expected pattern and silently losing
+    the observations that straddle a boundary.
 
-    Questa funzione spezza il file sui separatori di blocco, toglie le
-    4 cifre spurie da ogni blocco (tranne l'ultimo, che termina la
-    trasmissione) e ricompone lo stream continuo originale.
+    This function splits the file on the block separators, removes
+    the 4 spurious digits from each block (except the last one,
+    which terminates the transmission) and reassembles the original
+    continuous stream.
     """
 
-    # Blocchi separati da ETX CR LF STX
+    # Blocks separated by ETX CR LF STX
     parts = re.split(rb"\x03\r\n\x02", raw)
 
     if len(parts) < 2:
-        # Nessun framing riconosciuto: il file non e' segmentato in
-        # blocchi, restituiamo il dato cosi' com'e'.
+        # No framing recognized: the file is not segmented into
+        # blocks, so we return the data as-is.
         return raw.decode("latin-1")
 
-    # Il primo blocco puo' avere un NUL + STX iniziali da rimuovere
+    # The first block may have a leading NUL + STX to strip
     parts[0] = parts[0].lstrip(b"\x00\x02")
 
-    # L'ultimo blocco contiene la coda di trasmissione
-    # (ETX CR LF EOT CR LF): teniamo solo cio' che precede il primo ETX
+    # The last block contains the transmission trailer
+    # (ETX CR LF EOT CR LF): keep only what precedes the first ETX
     parts[-1] = parts[-1].split(b"\x03", 1)[0]
 
     cleaned = bytearray()
@@ -98,7 +99,7 @@ def clean_raw_data(raw):
 
     for i, part in enumerate(parts):
         if i < last_index and len(part) > 4:
-            # Rimuove le 4 cifre di contatore/checksum a fine blocco
+            # Strip the 4 counter/checksum digits at the end of the block
             cleaned += part[:-4]
         else:
             cleaned += part
@@ -107,16 +108,16 @@ def clean_raw_data(raw):
 
 
 # ============================================================
-# STAZIONE
+# STATION
 # ============================================================
 
 def find_station(data):
     """
-    Cerca:
+    Looks for:
 
         100_(P_)1.475
 
-    e restituisce:
+    and returns:
 
         station = 100
         instrument_height = 1.475
@@ -129,7 +130,7 @@ def find_station(data):
 
     if not match:
         raise ValueError(
-            "Impossibile trovare la stazione nel file."
+            "Could not find the station in the file."
         )
 
     station = int(match.group("station"))
@@ -139,12 +140,12 @@ def find_station(data):
 
 
 # ============================================================
-# ALTEZZA PRISMA
+# PRISM HEIGHT
 # ============================================================
 
 def find_prism_height(data):
     """
-    Cerca:
+    Looks for:
 
         _*V_,1.420_
 
@@ -157,37 +158,38 @@ def find_prism_height(data):
 
     if not match:
         raise ValueError(
-            "Impossibile trovare l'altezza prisma."
+            "Could not find the prism height."
         )
 
     return float(match.group("th"))
 
 
 # ============================================================
-# PARSING DELLE OSSERVAZIONI
+# OBSERVATION PARSING
 # ============================================================
 
 def parse_observations(data):
     """
-    Cerca record del tipo:
+    Looks for records such as:
 
         +101_ ?+00093978m1001100+0009350g+00093978t
 
-    NOTA SUI CAMPI ANGOLARI:
-    Confrontando l'estrazione con un export di riferimento dello stesso
-    rilievo (colonne "Horizontal Circle" e "Zenith Angle"), i due campi
-    angolari nel record grezzo sono nell'ordine opposto a quanto ci si
-    aspetterebbe intuitivamente:
+    NOTE ON THE ANGLE FIELDS:
+    Comparing the extraction against a reference export of the same
+    survey (columns "Horizontal Circle" and "Zenith Angle"), the two
+    angle fields in the raw record are in the opposite order from
+    what one would intuitively expect:
 
-        m<CAMPO_1>+<CAMPO_2>g
+        m<FIELD_1>+<FIELD_2>g
 
-        CAMPO_1 (subito dopo 'm', prima del '+')  -> Zenith Angle
-        CAMPO_2 (tra '+' e 'g')                   -> Horizontal Circle
+        FIELD_1 (right after 'm', before the '+')  -> Zenith Angle
+        FIELD_2 (between '+' and 'g')              -> Horizontal Circle
 
-    Per il punto 101 il record da' CAMPO_1=100.1100, CAMPO_2=0.9350,
-    e il file di riferimento conferma Zenith=100.1100, Horizontal
-    Circle=0.9350: quindi CAMPO_1 e' lo zenith, CAMPO_2 e' l'angolo
-    orizzontale (azimut/bearing), non il contrario.
+    For point 101 the record gives FIELD_1=100.1100, FIELD_2=0.9350,
+    and the reference file confirms Zenith=100.1100, Horizontal
+    Circle=0.9350: therefore FIELD_1 is the zenith angle and FIELD_2
+    is the horizontal angle (azimuth/bearing), not the other way
+    around.
     """
 
     pattern = re.compile(
@@ -221,7 +223,7 @@ def parse_observations(data):
         point = int(match.group("point"))
 
         # ----------------------------------------------------
-        # DISTANZA
+        # DISTANCE
         # ----------------------------------------------------
 
         distance_m = int(
@@ -233,16 +235,16 @@ def parse_observations(data):
         ) / 1000.0
 
         # ----------------------------------------------------
-        # ANGOLI
+        # ANGLES
         # ----------------------------------------------------
 
-        # Angolo orizzontale (Horizontal Circle / azimut-bearing)
+        # Horizontal angle (Horizontal Circle / azimuth-bearing)
         horizontal_gon = parse_gon(
             match.group("horizontal")
         )
 
-        # Angolo zenitale (Zenith Angle: 0 gon = zenit, 100 gon =
-        # orizzonte, 200 gon = nadir)
+        # Zenith angle (Zenith Angle: 0 gon = zenith, 100 gon =
+        # horizon, 200 gon = nadir)
         zenith_gon = parse_gon(
             match.group("zenith")
         )
@@ -259,7 +261,7 @@ def parse_observations(data):
 
 
 # ============================================================
-# CALCOLO COORDINATE
+# COORDINATE COMPUTATION
 # ============================================================
 
 def calculate_xyz(
@@ -270,32 +272,32 @@ def calculate_xyz(
     prism_height,
 ):
     """
-    Calcola X, Y, Z a partire da:
+    Compute X, Y, Z from:
 
-        distanza inclinata (slope distance)
-        angolo orizzontale (Horizontal Circle / bearing)
-        angolo zenitale (Zenith Angle)
+        slope distance
+        horizontal angle (Horizontal Circle / bearing)
+        zenith angle (Zenith Angle)
 
-    Convenzione Zenith Angle (standard stazione totale):
+    Zenith Angle convention (total station standard):
 
-        0 gon   = zenit (verticale, verso l'alto)
-        100 gon = orizzonte
-        200 gon = nadir (verticale, verso il basso)
+        0 gon   = zenith (vertical, upwards)
+        100 gon = horizon
+        200 gon = nadir (vertical, downwards)
 
-    Quindi:
+    Therefore:
 
-        componente_orizzontale = D * sin(Z)
-        dislivello (dz)        = D * cos(Z)
+        horizontal_component   = D * sin(Z)
+        height difference (dz) = D * cos(Z)
 
-    e:
+    and:
 
-        Z_quota = station_Z + dz + IH - TH
+        Z_elevation = station_Z + dz + IH - TH
     """
 
     H = gon_to_rad(horizontal_gon)
     Z = gon_to_rad(zenith_gon)
 
-    # Componente orizzontale (Zenith Angle: sin(Z) da' l'orizzontale)
+    # Horizontal component (Zenith Angle: sin(Z) gives the horizontal)
     horizontal_distance = distance * math.sin(Z)
 
     # --------------------------------------------------------
@@ -304,10 +306,10 @@ def calculate_xyz(
 
     if HORIZONTAL_FROM_NORTH:
 
-        # 0 gon = Nord
-        # 100 gon = Est
-        # 200 gon = Sud
-        # 300 gon = Ovest
+        # 0 gon = North
+        # 100 gon = East
+        # 200 gon = South
+        # 300 gon = West
 
         x = (
             STATION_X
@@ -321,8 +323,8 @@ def calculate_xyz(
 
     else:
 
-        # 0 gon = X positivo
-        # 100 gon = Y positivo
+        # 0 gon = positive X
+        # 100 gon = positive Y
 
         x = (
             STATION_X
@@ -356,21 +358,21 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Converte dati grezzi Topcon GTS-229 "
-            "in CSV con coordinate XYZ."
+            "Convert raw Topcon GTS-229 data "
+            "into a CSV with XYZ coordinates."
         )
     )
 
     parser.add_argument(
         "input",
-        help="File grezzo Topcon"
+        help="Raw Topcon file"
     )
 
     parser.add_argument(
         "-o",
         "--output",
         default="topcon_xyz.csv",
-        help="File CSV di output"
+        help="Output CSV file"
     )
 
     args = parser.parse_args()
@@ -379,36 +381,36 @@ def main():
     output_path = Path(args.output)
 
     # --------------------------------------------------------
-    # LETTURA FILE
+    # FILE READING
     # --------------------------------------------------------
 
     raw = input_path.read_bytes()
 
-    # Il file contiene caratteri di controllo e un framing seriale
-    # a blocchi (STX/ETX) con contatori spuri da rimuovere.
+    # The file contains control characters and a block-based serial
+    # framing (STX/ETX) with spurious counters to be removed.
     data = clean_raw_data(raw)
 
     # --------------------------------------------------------
-    # STAZIONE
+    # STATION
     # --------------------------------------------------------
 
     station, instrument_height = find_station(data)
 
     # --------------------------------------------------------
-    # PRISMA
+    # PRISM
     # --------------------------------------------------------
 
     prism_height = find_prism_height(data)
 
     # --------------------------------------------------------
-    # OSSERVAZIONI
+    # OBSERVATIONS
     # --------------------------------------------------------
 
     observations = parse_observations(data)
 
     if not observations:
         raise RuntimeError(
-            "Nessuna osservazione trovata nel file."
+            "No observations found in the file."
         )
 
     print()
@@ -416,13 +418,13 @@ def main():
     print("        TOPCON GTS-229 IMPORT")
     print("========================================")
     print()
-    print(f"Stazione:             {station}")
-    print(f"X stazione:           {STATION_X:.3f}")
-    print(f"Y stazione:           {STATION_Y:.3f}")
-    print(f"Z stazione:           {STATION_Z:.3f}")
-    print(f"Altezza strumento:    {instrument_height:.3f} m")
-    print(f"Altezza prisma:       {prism_height:.3f} m")
-    print(f"Osservazioni:         {len(observations)}")
+    print(f"Station:              {station}")
+    print(f"Station X:            {STATION_X:.3f}")
+    print(f"Station Y:            {STATION_Y:.3f}")
+    print(f"Station Z:            {STATION_Z:.3f}")
+    print(f"Instrument height:    {instrument_height:.3f} m")
+    print(f"Prism height:         {prism_height:.3f} m")
+    print(f"Observations:         {len(observations)}")
     print()
 
     # --------------------------------------------------------
@@ -456,7 +458,7 @@ def main():
         writer.writeheader()
 
         # ----------------------------------------------------
-        # STAZIONE
+        # STATION
         # ----------------------------------------------------
 
         writer.writerow({
@@ -473,7 +475,7 @@ def main():
         })
 
         # ----------------------------------------------------
-        # PUNTI
+        # POINTS
         # ----------------------------------------------------
 
         for obs in observations:
@@ -500,7 +502,7 @@ def main():
             })
 
             print(
-                f"Punto {obs['point']:>3}: "
+                f"Point {obs['point']:>3}: "
                 f"X={x:>10.3f} "
                 f"Y={y:>10.3f} "
                 f"Z={z:>10.3f} "
@@ -510,7 +512,7 @@ def main():
             )
 
     print()
-    print(f"CSV creato: {output_path}")
+    print(f"CSV created: {output_path}")
     print()
 
 

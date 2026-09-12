@@ -1,89 +1,88 @@
 # topcon2csv
 
-Conversione dei dati grezzi di una stazione totale **Topcon GTS-229** in un CSV
-con coordinate XYZ, partendo dal dump seriale dello strumento.
+Convert raw **Topcon GTS-229** total station serial dumps into a CSV with XYZ
+coordinates.
 
-## 1. Scaricare i dati dallo strumento
+## 1. Download the data from the instrument
 
-Collegare la stazione totale al PC con il cavo seriale (o con un adattatore
-USB-seriale, tipicamente `/dev/ttyUSB0`).
+Connect the total station to the PC with the serial cable (or with a USB-serial
+adapter, typically `/dev/ttyUSB0`).
 
-Configurare la porta e mettersi in ascolto:
+Configure the port and start listening:
 
 ```sh
 stty -F /dev/ttyUSB0 9600 cs8 -parenb cstopb -echo raw; cat /dev/ttyUSB0 > src.txt
 ```
 
-Significato dei parametri: 9600 baud, 8 bit di dati, nessuna parità, 2 bit di
-stop, nessun echo, nessuna elaborazione dei caratteri di controllo (`raw`) —
-indispensabile perché il dump contiene byte STX/ETX che non devono essere
-alterati.
+What the parameters mean: 9600 baud, 8 data bits, no parity, 2 stop bits, no
+echo, no processing of control characters (`raw`) — essential, because the dump
+contains STX/ETX bytes that must not be altered.
 
-Poi, sullo strumento, avviare il trasferimento dei dati (menu di
-comunicazione / *send data*). I byte arrivano su `src.txt` mentre `cat` resta in
-esecuzione: quando il trasferimento è finito, fermarlo con `Ctrl+C`.
+Then, on the instrument, start the data transfer (communication menu / *send
+data*). The bytes land in `src.txt` while `cat` keeps running: when the transfer
+is over, stop it with `Ctrl+C`.
 
-Verifica rapida che il file contenga qualcosa:
+Quick check that the file actually contains something:
 
 ```sh
 ls -l src.txt
 ```
 
-Se il file resta vuoto: controllare che la porta sia quella giusta
-(`dmesg | tail` dopo aver collegato l'adattatore), che i baud rate impostati
-sullo strumento e sulla porta coincidano, e che l'utente abbia accesso alla
-seriale (gruppo `uucp` o `dialout` a seconda della distribuzione).
+If the file stays empty: check that the port is the right one (`dmesg | tail`
+after plugging in the adapter), that the baud rates set on the instrument and on
+the port match, and that your user has access to the serial port (group `uucp`
+or `dialout` depending on the distribution).
 
-## 2. Convertire in CSV
+## 2. Convert to CSV
 
-Serve solo Python 3 (nessuna dipendenza esterna):
+Only Python 3 is required (no external dependencies):
 
 ```sh
 python3 topcon2csv.py src.txt -o topcon_xyz.csv
 ```
 
-Opzioni:
+Options:
 
-- `input` — file grezzo scaricato dallo strumento (posizionale, obbligatorio)
-- `-o`, `--output` — file CSV di output (default: `topcon_xyz.csv`)
+- `input` — raw file downloaded from the instrument (positional, required)
+- `-o`, `--output` — output CSV file (default: `topcon_xyz.csv`)
 
-Lo script stampa a schermo il riepilogo (stazione, altezza strumento, altezza
-prisma, numero di osservazioni) e la lista dei punti calcolati.
+The script prints a summary (station, instrument height, prism height, number of
+observations) and the list of computed points.
 
 ## 3. Output
 
-Il CSV contiene una riga per la stazione e una riga per ogni punto rilevato,
-con le colonne:
+The CSV contains one row for the station and one row for each surveyed point,
+with the following columns:
 
-| Colonna | Descrizione |
+| Column | Description |
 | --- | --- |
-| `pid` | numero del punto |
-| `station` | numero della stazione di riferimento |
-| `x`, `y`, `z` | coordinate calcolate (m) |
-| `distance` | distanza inclinata (m) |
-| `horizontal_gon` | angolo orizzontale / cerchio orizzontale (gon) |
-| `zenith_gon` | angolo zenitale (gon, 0 = zenit, 100 = orizzonte) |
-| `instrument_height` | altezza strumento (m) |
-| `prism_height` | altezza prisma (m) |
+| `pid` | point number |
+| `station` | number of the reference station |
+| `x`, `y`, `z` | computed coordinates (m) |
+| `distance` | slope distance (m) |
+| `horizontal_gon` | horizontal angle / horizontal circle (gon) |
+| `zenith_gon` | zenith angle (gon, 0 = zenith, 100 = horizon) |
+| `instrument_height` | instrument height (m) |
+| `prism_height` | prism height (m) |
 
-## 4. Configurazione
+## 4. Configuration
 
-I parametri di calcolo sono costanti in testa a `topcon2csv.py`, da modificare
-se il rilievo non parte da coordinate nulle:
+The computation parameters are constants at the top of `topcon2csv.py`, to be
+edited if the survey does not start from zero coordinates:
 
-- `STATION_X`, `STATION_Y`, `STATION_Z` — coordinate della stazione
-  (default `0, 0, 0`: le coordinate risultano relative alla stazione)
-- `HORIZONTAL_FROM_NORTH` — `True` (default): 0 gon = Nord, angoli crescenti in
-  senso orario; `False`: 0 gon = asse X, angoli crescenti in senso antiorario
+- `STATION_X`, `STATION_Y`, `STATION_Z` — station coordinates
+  (default `0, 0, 0`: the resulting coordinates are relative to the station)
+- `HORIZONTAL_FROM_NORTH` — `True` (default): 0 gon = North, angles increasing
+  clockwise; `False`: 0 gon = X axis, angles increasing counter-clockwise
 
-L'altezza strumento e l'altezza prisma vengono lette automaticamente dal file
-grezzo.
+The instrument height and the prism height are read automatically from the raw
+file.
 
-## Note sul formato grezzo
+## Notes on the raw format
 
-Il dump seriale è suddiviso in blocchi da 132 caratteri delimitati da `STX`
-(`0x02`) e `ETX CR LF` (`0x03 0x0D 0x0A`); le ultime 4 cifre di ogni blocco sono
-un contatore del protocollo di trasferimento e **non** fanno parte dei dati.
-Lo script le rimuove prima del parsing: leggere il file come testo continuo
-senza questa pulizia spezza i campi numerici a cavallo dei confini di blocco e
-fa perdere silenziosamente delle osservazioni.
+The serial dump is split into 132-character blocks delimited by `STX` (`0x02`)
+and `ETX CR LF` (`0x03 0x0D 0x0A`); the last 4 digits of each block are a
+transfer protocol counter and are **not** part of the data. The script strips
+them before parsing: reading the file as continuous text without this cleanup
+breaks the numeric fields that straddle block boundaries and silently loses
+observations.

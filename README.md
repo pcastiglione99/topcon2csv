@@ -56,8 +56,8 @@ with the following columns:
 
 | Column | Description |
 | --- | --- |
-| `pid` | point number |
-| `station` | number of the reference station |
+| `pid` | point name (numeric or alphanumeric, e.g. `101`, `A1`) |
+| `station` | name of the reference station |
 | `x`, `y`, `z` | computed coordinates (m) |
 | `distance` | slope distance (m) |
 | `horizontal_gon` | horizontal angle / horizontal circle (gon) |

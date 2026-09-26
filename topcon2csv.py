@@ -10,6 +10,12 @@ from pathlib import Path
 STX = b"\x02"
 ETX = b"\x03"
 
+# Point/station name: any run of characters that are not field
+# separators ('_'), record markers ('+', "'") or whitespace.
+# Covers plain numbers (100, 101) as well as names like A1, PS-3, S.2.
+# Names are kept as strings, so leading zeros are preserved.
+NAME = r"[^_+'\s]+"
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -119,12 +125,14 @@ def find_station(data):
 
     and returns:
 
-        station = 100
+        station = "100"
         instrument_height = 1.475
+
+    The station name may be any NAME (e.g. S1_(ST_)1.475 -> "S1").
     """
 
     match = re.search(
-        r"(?P<station>\d+)_\((?:P|ST)_\)(?P<ih>\d+(?:\.\d+)?)",
+        rf"(?P<station>{NAME})_\((?:P|ST)_\)(?P<ih>\d+(?:\.\d+)?)",
         data
     )
 
@@ -133,7 +141,7 @@ def find_station(data):
             "Could not find the station in the file."
         )
 
-    station = int(match.group("station"))
+    station = match.group("station")
     instrument_height = float(match.group("ih"))
 
     return station, instrument_height
@@ -190,12 +198,14 @@ def parse_observations(data):
     Circle=0.9350: therefore FIELD_1 is the zenith angle and FIELD_2
     is the horizontal angle (azimuth/bearing), not the other way
     around.
+
+    The point name may be any NAME (e.g. +A1_ ?+...).
     """
 
     pattern = re.compile(
-        r"""
+        rf"""
         \+
-        (?P<point>\d+)
+        (?P<point>{NAME})
         _
         [^+]*
 
@@ -220,7 +230,7 @@ def parse_observations(data):
 
     for match in pattern.finditer(data):
 
-        point = int(match.group("point"))
+        point = match.group("point")
 
         # ----------------------------------------------------
         # DISTANCE
@@ -428,7 +438,7 @@ def main():
     print()
 
     # Angle-only records (no distance measured) cannot produce XYZ
-    angle_only = re.findall(r"\+(\d+)_ <", data)
+    angle_only = re.findall(rf"\+({NAME})_ <", data)
 
     if angle_only:
         print(

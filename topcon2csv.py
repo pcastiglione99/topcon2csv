@@ -115,7 +115,7 @@ def find_station(data):
     """
     Looks for:
 
-        100_(P_)1.475
+        100_(P_)1.475    or    100_(ST_)1.475
 
     and returns:
 
@@ -124,7 +124,7 @@ def find_station(data):
     """
 
     match = re.search(
-        r"(?P<station>\d+)_\(P_\)(?P<ih>\d+(?:\.\d+)?)",
+        r"(?P<station>\d+)_\((?:P|ST)_\)(?P<ih>\d+(?:\.\d+)?)",
         data
     )
 
@@ -147,12 +147,12 @@ def find_prism_height(data):
     """
     Looks for:
 
-        _*V_,1.420_
+        _*V_,1.420_    or    _*_,1.420_
 
     """
 
     match = re.search(
-        r"_\*?V_,(?P<th>\d+(?:\.\d+)?)_",
+        r"_\*?V?_,(?P<th>\d+(?:\.\d+)?)_",
         data
     )
 
@@ -426,6 +426,16 @@ def main():
     print(f"Prism height:         {prism_height:.3f} m")
     print(f"Observations:         {len(observations)}")
     print()
+
+    # Angle-only records (no distance measured) cannot produce XYZ
+    angle_only = re.findall(r"\+(\d+)_ <", data)
+
+    if angle_only:
+        print(
+            "WARNING: skipped angle-only points (no distance): "
+            + ", ".join(angle_only)
+        )
+        print()
 
     # --------------------------------------------------------
     # CSV

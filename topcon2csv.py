@@ -4,6 +4,7 @@ import argparse
 import csv
 import math
 import re
+import sys
 from pathlib import Path
 
 # Framing bytes used by the Topcon serial transfer
@@ -16,19 +17,28 @@ ETX = b"\x03"
 # Names are kept as strings, so leading zeros are preserved.
 NAME = r"[^_+'\s]+"
 
+# Decimal number such as 1.450 (instrument/prism heights)
+NUMBER = r"\d+(?:\.\d+)?"
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# Station coordinates
+# Default station coordinates (override with --station-xyz / --station)
 STATION_X = 0.0
 STATION_Y = 0.0
 STATION_Z = 0.0
 
-# Horizontal angle convention:
+# Horizontal angle convention (override with --from-x-axis):
 # True  -> 0 gon = North, angle increasing clockwise
 # False -> 0 gon = X axis, angle increasing counter-clockwise
 HORIZONTAL_FROM_NORTH = True
+
+# Maximum accepted difference (m) between the horizontal distance sent
+# by the instrument ('t' field) and the one recomputed from slope
+# distance and zenith angle. A larger difference means the record was
+# not decoded as expected.
+HD_TOLERANCE = 0.005
 
 
 # ============================================================
@@ -114,160 +124,214 @@ def clean_raw_data(raw):
 
 
 # ============================================================
-# STATION
+# RECORD PARSING
 # ============================================================
 
-def find_station(data):
+# The cleaned stream is a sequence of records, read in order:
+#
+#   station set-up:        100_(ST_)1.450         or  100_(P_)1.475
+#   full observation:      +101_ ?+00093978m1001100+0009350g+00093978t
+#   angle-only observation: +101_ <1004720+1373210
+#   point code + prism:    _*V_,1.420_            or  _*_,1.400_
+#
+# NOTE ON THE ANGLE FIELDS:
+# Comparing the extraction against a reference export of the same
+# survey (columns "Horizontal Circle" and "Zenith Angle"), the two
+# angle fields in the raw record are in the opposite order from
+# what one would intuitively expect:
+#
+#     m<FIELD_1>+<FIELD_2>g
+#
+#     FIELD_1 (right after 'm', before the '+')  -> Zenith Angle
+#     FIELD_2 (between '+' and 'g')              -> Horizontal Circle
+#
+# For point 101 the record gives FIELD_1=100.1100, FIELD_2=0.9350,
+# and the reference file confirms Zenith=100.1100, Horizontal
+# Circle=0.9350: therefore FIELD_1 is the zenith angle and FIELD_2
+# is the horizontal angle (azimuth/bearing), not the other way
+# around. The same order is assumed for angle-only records.
+#
+# The 't' field is the horizontal distance computed by the
+# instrument: it is used to verify this interpretation (see
+# check_horizontal_distance).
+
+RECORD_PATTERN = re.compile(
+    rf"""
+    (?P<station>{NAME})
+    _\((?:P|ST)_\)
+    (?P<ih>{NUMBER})
+
+    |
+
+    \+
+    (?P<point>{NAME})
+    _
+    [^+]*
+
+    \+
+    (?P<distance_m>\d+)
+    m
+
+    (?P<zenith>\d+)
+
+    \+
+    (?P<horizontal>\d+)
+    g
+
+    \+
+    (?P<distance_t>\d+)
+    t
+
+    |
+
+    \+
+    (?P<angle_point>{NAME})
+    _\ <
+    (?P<angle_zenith>\d+)
+    \+
+    (?P<angle_horizontal>\d+)
+
+    |
+
+    _\*?
+    (?P<code>[^_]*)
+    _,
+    (?P<th>{NUMBER})
+    _
+    """,
+    re.VERBOSE
+)
+
+
+def parse_survey(data):
     """
-    Looks for:
+    Read the cleaned stream in order and return:
 
-        100_(P_)1.475    or    100_(ST_)1.475
+        setups:        [{"station": "100", "instrument_height": 1.45}, ...]
+        observations:  [{"point": "101", "setup": 0, ...}, ...]
 
-    and returns:
+    Each observation refers to the station set-up that precedes it
+    ("setup" is the index in setups). Repeated identical set-up
+    records (the instrument often sends the station twice) are
+    merged.
 
-        station = "100"
-        instrument_height = 1.475
-
-    The station name may be any NAME (e.g. S1_(ST_)1.475 -> "S1").
+    PRISM HEIGHT:
+    The code/prism record that follows an observation belongs to it,
+    so every point gets its own prism height. An observation without
+    its own prism record uses the last prism height seen before it,
+    or the first one in the file if none was seen yet.
     """
 
-    match = re.search(
-        rf"(?P<station>{NAME})_\((?:P|ST)_\)(?P<ih>\d+(?:\.\d+)?)",
-        data
-    )
+    setups = []
+    observations = []
 
-    if not match:
+    first_th = None
+    current_th = None
+
+    for match in RECORD_PATTERN.finditer(data):
+
+        if match.group("station") is not None:
+
+            setup = {
+                "station": match.group("station"),
+                "instrument_height": float(match.group("ih")),
+            }
+
+            if not setups or setups[-1] != setup:
+                setups.append(setup)
+
+        elif match.group("point") is not None:
+
+            observations.append({
+                "point": match.group("point"),
+                "setup": len(setups) - 1,
+                "angle_only": False,
+                # Distances are in mm
+                "distance_m": int(match.group("distance_m")) / 1000.0,
+                "distance_t": int(match.group("distance_t")) / 1000.0,
+                "horizontal_gon": parse_gon(match.group("horizontal")),
+                "zenith_gon": parse_gon(match.group("zenith")),
+                "code": "",
+                "prism_height": None,
+                "previous_th": current_th,
+            })
+
+        elif match.group("angle_point") is not None:
+
+            observations.append({
+                "point": match.group("angle_point"),
+                "setup": len(setups) - 1,
+                "angle_only": True,
+                "distance_m": None,
+                "distance_t": None,
+                "horizontal_gon": parse_gon(
+                    match.group("angle_horizontal")
+                ),
+                "zenith_gon": parse_gon(match.group("angle_zenith")),
+                "code": "",
+                "prism_height": None,
+                "previous_th": current_th,
+            })
+
+        else:
+
+            th = float(match.group("th"))
+
+            if first_th is None:
+                first_th = th
+
+            current_th = th
+
+            if observations and observations[-1]["prism_height"] is None:
+                observations[-1]["prism_height"] = th
+                observations[-1]["code"] = match.group("code")
+
+    if not setups:
         raise ValueError(
             "Could not find the station in the file."
         )
 
-    station = match.group("station")
-    instrument_height = float(match.group("ih"))
-
-    return station, instrument_height
-
-
-# ============================================================
-# PRISM HEIGHT
-# ============================================================
-
-def find_prism_height(data):
-    """
-    Looks for:
-
-        _*V_,1.420_    or    _*_,1.420_
-
-    """
-
-    match = re.search(
-        r"_\*?V?_,(?P<th>\d+(?:\.\d+)?)_",
-        data
-    )
-
-    if not match:
+    if first_th is None:
         raise ValueError(
             "Could not find the prism height."
         )
 
-    return float(match.group("th"))
+    for obs in observations:
+
+        # Observations sent before any station record belong to the
+        # first station
+        if obs["setup"] < 0:
+            obs["setup"] = 0
+
+        if obs["prism_height"] is None:
+            if obs["previous_th"] is not None:
+                obs["prism_height"] = obs["previous_th"]
+            else:
+                obs["prism_height"] = first_th
+
+        del obs["previous_th"]
+
+    return setups, observations
 
 
 # ============================================================
-# OBSERVATION PARSING
+# CONSISTENCY CHECK
 # ============================================================
 
-def parse_observations(data):
+def check_horizontal_distance(obs):
     """
-    Looks for records such as:
+    Compare the horizontal distance sent by the instrument ('t'
+    field) with D * sin(Z) recomputed from slope distance and zenith
+    angle. Returns the difference in metres.
 
-        +101_ ?+00093978m1001100+0009350g+00093978t
-
-    NOTE ON THE ANGLE FIELDS:
-    Comparing the extraction against a reference export of the same
-    survey (columns "Horizontal Circle" and "Zenith Angle"), the two
-    angle fields in the raw record are in the opposite order from
-    what one would intuitively expect:
-
-        m<FIELD_1>+<FIELD_2>g
-
-        FIELD_1 (right after 'm', before the '+')  -> Zenith Angle
-        FIELD_2 (between '+' and 'g')              -> Horizontal Circle
-
-    For point 101 the record gives FIELD_1=100.1100, FIELD_2=0.9350,
-    and the reference file confirms Zenith=100.1100, Horizontal
-    Circle=0.9350: therefore FIELD_1 is the zenith angle and FIELD_2
-    is the horizontal angle (azimuth/bearing), not the other way
-    around.
-
-    The point name may be any NAME (e.g. +A1_ ?+...).
+    If the zenith and horizontal fields were swapped, or the record
+    was otherwise misread, the difference is large.
     """
 
-    pattern = re.compile(
-        rf"""
-        \+
-        (?P<point>{NAME})
-        _
-        [^+]*
+    Z = gon_to_rad(obs["zenith_gon"])
+    expected = obs["distance_m"] * math.sin(Z)
 
-        \+
-        (?P<distance_m>\d+)
-        m
-
-        (?P<zenith>\d+)
-
-        \+
-        (?P<horizontal>\d+)
-        g
-
-        \+
-        (?P<distance_t>\d+)
-        t
-        """,
-        re.VERBOSE
-    )
-
-    observations = []
-
-    for match in pattern.finditer(data):
-
-        point = match.group("point")
-
-        # ----------------------------------------------------
-        # DISTANCE
-        # ----------------------------------------------------
-
-        distance_m = int(
-            match.group("distance_m")
-        ) / 1000.0
-
-        distance_t = int(
-            match.group("distance_t")
-        ) / 1000.0
-
-        # ----------------------------------------------------
-        # ANGLES
-        # ----------------------------------------------------
-
-        # Horizontal angle (Horizontal Circle / azimuth-bearing)
-        horizontal_gon = parse_gon(
-            match.group("horizontal")
-        )
-
-        # Zenith angle (Zenith Angle: 0 gon = zenith, 100 gon =
-        # horizon, 200 gon = nadir)
-        zenith_gon = parse_gon(
-            match.group("zenith")
-        )
-
-        observations.append({
-            "point": point,
-            "distance_m": distance_m,
-            "distance_t": distance_t,
-            "horizontal_gon": horizontal_gon,
-            "zenith_gon": zenith_gon,
-        })
-
-    return observations
+    return abs(expected - obs["distance_t"])
 
 
 # ============================================================
@@ -280,6 +344,8 @@ def calculate_xyz(
     zenith_gon,
     instrument_height,
     prism_height,
+    station_xyz=(STATION_X, STATION_Y, STATION_Z),
+    from_north=HORIZONTAL_FROM_NORTH,
 ):
     """
     Compute X, Y, Z from:
@@ -304,6 +370,8 @@ def calculate_xyz(
         Z_elevation = station_Z + dz + IH - TH
     """
 
+    station_x, station_y, station_z = station_xyz
+
     H = gon_to_rad(horizontal_gon)
     Z = gon_to_rad(zenith_gon)
 
@@ -314,7 +382,7 @@ def calculate_xyz(
     # X / Y
     # --------------------------------------------------------
 
-    if HORIZONTAL_FROM_NORTH:
+    if from_north:
 
         # 0 gon = North
         # 100 gon = East
@@ -322,12 +390,12 @@ def calculate_xyz(
         # 300 gon = West
 
         x = (
-            STATION_X
+            station_x
             + horizontal_distance * math.sin(H)
         )
 
         y = (
-            STATION_Y
+            station_y
             + horizontal_distance * math.cos(H)
         )
 
@@ -337,12 +405,12 @@ def calculate_xyz(
         # 100 gon = positive Y
 
         x = (
-            STATION_X
+            station_x
             + horizontal_distance * math.cos(H)
         )
 
         y = (
-            STATION_Y
+            station_y
             + horizontal_distance * math.sin(H)
         )
 
@@ -351,7 +419,7 @@ def calculate_xyz(
     # --------------------------------------------------------
 
     z = (
-        STATION_Z
+        station_z
         + distance * math.cos(Z)
         + instrument_height
         - prism_height
@@ -361,10 +429,10 @@ def calculate_xyz(
 
 
 # ============================================================
-# MAIN
+# COMMAND LINE
 # ============================================================
 
-def main():
+def parse_args(argv=None):
 
     parser = argparse.ArgumentParser(
         description=(
@@ -385,10 +453,77 @@ def main():
         help="Output CSV file"
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--station-xyz",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        default=(STATION_X, STATION_Y, STATION_Z),
+        help=(
+            "Coordinates of the station "
+            f"(default: {STATION_X:g} {STATION_Y:g} {STATION_Z:g})"
+        )
+    )
+
+    parser.add_argument(
+        "--station",
+        nargs=4,
+        action="append",
+        default=[],
+        metavar=("NAME", "X", "Y", "Z"),
+        help=(
+            "Coordinates of a specific station, for files with "
+            "several stations (repeatable)"
+        )
+    )
+
+    parser.add_argument(
+        "--from-x-axis",
+        action="store_true",
+        help=(
+            "0 gon = X axis, angles counter-clockwise "
+            "(default: 0 gon = North, clockwise)"
+        )
+    )
+
+    parser.add_argument(
+        "--include-angle-only",
+        action="store_true",
+        help=(
+            "Write angle-only points (no distance) to the CSV "
+            "with empty coordinates"
+        )
+    )
+
+    args = parser.parse_args(argv)
+
+    station_coordinates = {}
+
+    for name, *xyz in args.station:
+        try:
+            station_coordinates[name] = tuple(float(v) for v in xyz)
+        except ValueError:
+            parser.error(
+                f"--station {name}: coordinates must be numbers"
+            )
+
+    args.station_coordinates = station_coordinates
+
+    return args
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main(argv=None):
+
+    args = parse_args(argv)
 
     input_path = Path(args.input)
     output_path = Path(args.output)
+
+    from_north = not args.from_x_axis
 
     # --------------------------------------------------------
     # FILE READING
@@ -401,50 +536,116 @@ def main():
     data = clean_raw_data(raw)
 
     # --------------------------------------------------------
-    # STATION
+    # PARSING
     # --------------------------------------------------------
 
-    station, instrument_height = find_station(data)
+    setups, observations = parse_survey(data)
 
-    # --------------------------------------------------------
-    # PRISM
-    # --------------------------------------------------------
+    measured = [obs for obs in observations if not obs["angle_only"]]
+    angle_only = [obs for obs in observations if obs["angle_only"]]
 
-    prism_height = find_prism_height(data)
-
-    # --------------------------------------------------------
-    # OBSERVATIONS
-    # --------------------------------------------------------
-
-    observations = parse_observations(data)
-
-    if not observations:
-        raise RuntimeError(
+    if not measured and not (args.include_angle_only and angle_only):
+        raise ValueError(
             "No observations found in the file."
         )
+
+    def station_xyz(station):
+        return args.station_coordinates.get(station, args.station_xyz)
+
+    station_names = []
+
+    for setup in setups:
+        if setup["station"] not in station_names:
+            station_names.append(setup["station"])
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
 
     print()
     print("========================================")
     print("        TOPCON GTS-229 IMPORT")
     print("========================================")
     print()
-    print(f"Station:              {station}")
-    print(f"Station X:            {STATION_X:.3f}")
-    print(f"Station Y:            {STATION_Y:.3f}")
-    print(f"Station Z:            {STATION_Z:.3f}")
-    print(f"Instrument height:    {instrument_height:.3f} m")
-    print(f"Prism height:         {prism_height:.3f} m")
-    print(f"Observations:         {len(observations)}")
+
+    for setup in setups:
+        x, y, z = station_xyz(setup["station"])
+        print(f"Station:              {setup['station']}")
+        print(f"Station X:            {x:.3f}")
+        print(f"Station Y:            {y:.3f}")
+        print(f"Station Z:            {z:.3f}")
+        print(f"Instrument height:    {setup['instrument_height']:.3f} m")
+        print()
+
+    prism_heights = sorted({obs["prism_height"] for obs in observations})
+
+    print(
+        "Prism height:         "
+        + ", ".join(f"{th:.3f}" for th in prism_heights)
+        + " m"
+    )
+    print(f"Observations:         {len(measured)}")
     print()
 
-    # Angle-only records (no distance measured) cannot produce XYZ
-    angle_only = re.findall(rf"\+({NAME})_ <", data)
+    # --------------------------------------------------------
+    # WARNINGS
+    # --------------------------------------------------------
+
+    warnings = []
+
+    unknown = sorted(set(args.station_coordinates) - set(station_names))
+
+    if unknown:
+        warnings.append(
+            "--station given for stations not in the file: "
+            + ", ".join(unknown)
+        )
+
+    if len(station_names) > 1:
+        default_stations = [
+            name for name in station_names
+            if name not in args.station_coordinates
+        ]
+
+        if len(default_stations) > 1:
+            warnings.append(
+                "several stations use the same default coordinates "
+                f"({', '.join(default_stations)}): give each one its "
+                "own coordinates with --station NAME X Y Z"
+            )
+
+        warnings.append(
+            "several stations in the file: the horizontal circle of "
+            "each set-up is used as-is, check that they share the "
+            "same orientation"
+        )
 
     if angle_only:
-        print(
-            "WARNING: skipped angle-only points (no distance): "
-            + ", ".join(angle_only)
+        action = (
+            "written without coordinates"
+            if args.include_angle_only
+            else "skipped"
         )
+        warnings.append(
+            f"angle-only points (no distance) {action}: "
+            + ", ".join(obs["point"] for obs in angle_only)
+        )
+
+    for obs in measured:
+        difference = check_horizontal_distance(obs)
+
+        if difference > HD_TOLERANCE:
+            warnings.append(
+                f"point {obs['point']}: horizontal distance from the "
+                f"instrument ({obs['distance_t']:.3f} m) differs by "
+                f"{difference:.3f} m from the computed one, the record "
+                "may be misread"
+            )
+
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+
+    if warnings:
         print()
 
     # --------------------------------------------------------
@@ -477,59 +678,90 @@ def main():
 
         writer.writeheader()
 
-        # ----------------------------------------------------
-        # STATION
-        # ----------------------------------------------------
+        for index, setup in enumerate(setups):
 
-        writer.writerow({
-            "pid": station,
-            "station": station,
-            "x": STATION_X,
-            "y": STATION_Y,
-            "z": STATION_Z,
-            "distance": "",
-            "horizontal_gon": "",
-            "zenith_gon": "",
-            "instrument_height": instrument_height,
-            "prism_height": "",
-        })
+            station = setup["station"]
+            instrument_height = setup["instrument_height"]
+            sx, sy, sz = station_xyz(station)
 
-        # ----------------------------------------------------
-        # POINTS
-        # ----------------------------------------------------
-
-        for obs in observations:
-
-            x, y, z = calculate_xyz(
-                distance=obs["distance_m"],
-                horizontal_gon=obs["horizontal_gon"],
-                zenith_gon=obs["zenith_gon"],
-                instrument_height=instrument_height,
-                prism_height=prism_height,
-            )
+            # ------------------------------------------------
+            # STATION
+            # ------------------------------------------------
 
             writer.writerow({
-                "pid": obs["point"],
+                "pid": station,
                 "station": station,
-                "x": f"{x:.6f}",
-                "y": f"{y:.6f}",
-                "z": f"{z:.6f}",
-                "distance": f"{obs['distance_m']:.3f}",
-                "horizontal_gon": f"{obs['horizontal_gon']:.4f}",
-                "zenith_gon": f"{obs['zenith_gon']:.4f}",
+                "x": f"{sx:.6f}",
+                "y": f"{sy:.6f}",
+                "z": f"{sz:.6f}",
+                "distance": "",
+                "horizontal_gon": "",
+                "zenith_gon": "",
                 "instrument_height": f"{instrument_height:.3f}",
-                "prism_height": f"{prism_height:.3f}",
+                "prism_height": "",
             })
 
-            print(
-                f"Point {obs['point']:>3}: "
-                f"X={x:>10.3f} "
-                f"Y={y:>10.3f} "
-                f"Z={z:>10.3f} "
-                f"D={obs['distance_m']:.3f} m "
-                f"H={obs['horizontal_gon']:.4f} gon "
-                f"Z={obs['zenith_gon']:.4f} gon"
-            )
+            # ------------------------------------------------
+            # POINTS
+            # ------------------------------------------------
+
+            for obs in observations:
+
+                if obs["setup"] != index:
+                    continue
+
+                if obs["angle_only"]:
+
+                    if not args.include_angle_only:
+                        continue
+
+                    writer.writerow({
+                        "pid": obs["point"],
+                        "station": station,
+                        "x": "",
+                        "y": "",
+                        "z": "",
+                        "distance": "",
+                        "horizontal_gon": f"{obs['horizontal_gon']:.4f}",
+                        "zenith_gon": f"{obs['zenith_gon']:.4f}",
+                        "instrument_height": f"{instrument_height:.3f}",
+                        "prism_height": f"{obs['prism_height']:.3f}",
+                    })
+
+                    continue
+
+                x, y, z = calculate_xyz(
+                    distance=obs["distance_m"],
+                    horizontal_gon=obs["horizontal_gon"],
+                    zenith_gon=obs["zenith_gon"],
+                    instrument_height=instrument_height,
+                    prism_height=obs["prism_height"],
+                    station_xyz=(sx, sy, sz),
+                    from_north=from_north,
+                )
+
+                writer.writerow({
+                    "pid": obs["point"],
+                    "station": station,
+                    "x": f"{x:.6f}",
+                    "y": f"{y:.6f}",
+                    "z": f"{z:.6f}",
+                    "distance": f"{obs['distance_m']:.3f}",
+                    "horizontal_gon": f"{obs['horizontal_gon']:.4f}",
+                    "zenith_gon": f"{obs['zenith_gon']:.4f}",
+                    "instrument_height": f"{instrument_height:.3f}",
+                    "prism_height": f"{obs['prism_height']:.3f}",
+                })
+
+                print(
+                    f"Point {obs['point']:>3}: "
+                    f"X={x:>10.3f} "
+                    f"Y={y:>10.3f} "
+                    f"Z={z:>10.3f} "
+                    f"D={obs['distance_m']:.3f} m "
+                    f"H={obs['horizontal_gon']:.4f} gon "
+                    f"Z={obs['zenith_gon']:.4f} gon"
+                )
 
     print()
     print(f"CSV created: {output_path}")
@@ -537,4 +769,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        sys.exit(f"Error: {error}")

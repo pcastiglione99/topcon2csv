@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+*.csv
+
+# Raw dumps downloaded from the instrument
+src.txt
